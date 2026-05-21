@@ -1,0 +1,21 @@
+spring:
+  application:
+    name: stattracker-bot
+  # load the secret file
+  config:
+    import: optional:classpath:application-secret.yml
+
+  data:
+    mongodb:
+      uri: ${MONGODB_URI:mongodb://localhost:27017/stattracker}
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2000ms
+
+# Use fake placeholders here
+external:
+  discord-token: ${DISCORD_BOT_TOKEN:mock-discord-token}
+  riot-api-key: ${RIOT_API_KEY:mock-riot-key}
+  apex-api-key: ${APEX_API_KEY:mock-apex-key}
+  fortnite-api-key: ${FORTNITE_API_KEY:mock-fortnite-key}

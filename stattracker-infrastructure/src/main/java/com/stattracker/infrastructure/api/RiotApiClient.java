@@ -12,25 +12,23 @@ import org.springframework.web.reactive.function.client.WebClient;
 import java.time.Instant;
 import java.util.*;
 
-/**
- * Riot Games API client — handles both Valorant and League of Legends.
- * Uses the Riot Account API + game-specific endpoints.
- *
- * <p>Valorant stats come from the VAL-CONTENT and VAL-MATCH endpoints.
- * League stats come from the SUMMONER and LEAGUE endpoints.</p>
- */
 @Component
 public class RiotApiClient implements GameApiClient {
 
     private static final Logger log = LoggerFactory.getLogger(RiotApiClient.class);
 
-    private final WebClient webClient;
+    private final WebClient riotWebClient;
+    private final WebClient henrikWebClient;
 
-    private final String riotApiKey;
-
-    public RiotApiClient(@Qualifier("riotWebClient") WebClient webClient, ExternalSecrets secrets) {
-        this.webClient = webClient;
-        this.riotApiKey = secrets.getRiotApiKey();
+    public RiotApiClient(@Qualifier("riotWebClient") WebClient riotWebClient, ExternalSecrets secrets) {
+        this.riotWebClient  = riotWebClient;
+        this.henrikWebClient = WebClient.builder()
+                .baseUrl("https://api.henrikdev.xyz")
+                .defaultHeader("Authorization", secrets.getHenrikApiKey())
+                .codecs(configurer -> configurer
+                        .defaultCodecs()
+                        .maxInMemorySize(10 * 1024 * 1024)) // 10MB
+                .build();
     }
 
     @Override
@@ -42,94 +40,209 @@ public class RiotApiClient implements GameApiClient {
     public PlayerStats fetchPlayerStats(String username, String region) {
         log.info("Fetching Valorant stats for {} ({})", username, region);
 
-        // Parse Riot ID (name#tag)
-        String[] parts = username.contains("#")
-                ? username.split("#", 2)
-                : new String[]{username, region};
+        String[] parts    = username.contains("#") ? username.split("#", 2) : new String[]{username, "NA1"};
+        String gameName   = parts[0];
+        String tagLine    = parts[1];
 
-        String gameName = parts[0];
-        String tagLine = parts.length > 1 ? parts[1] : "NA1";
+        // Resolve PUUID via official Riot API
+        String puuid = resolvePuuid(gameName, tagLine);
 
-        // Call Riot Account API to resolve PUUID
-        String puuid = "unknown";
+        // Pull the most recent match to get current rank
+        String rankTier = "Unranked";
+        int    rr       = 0;
+
         try {
-            Map<?, ?> account = webClient.get()
+            Map<?, ?> response = henrikWebClient.get()
+                    .uri("/valorant/v4/matches/{region}/pc/{name}/{tag}?size=1",
+                            region.toLowerCase(), gameName, tagLine)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+
+            if (response != null && response.containsKey("data")) {
+                List<Map<?, ?>> matchList = (List<Map<?, ?>>) response.get("data");
+
+                if (!matchList.isEmpty()) {
+                    Map<?, ?> firstMatch = matchList.get(0);
+                    Map<?, ?> targetPlayer = findPlayer(firstMatch, gameName, tagLine);
+
+                    if (targetPlayer != null) {
+                        Map<?, ?> tier = (Map<?, ?>) targetPlayer.get("tier");
+                        rankTier = (String) tier.get("name");
+                    } else {
+                        log.warn("targetPlayer is null for {}#{}", gameName, tagLine);
+                    }
+                } else {
+                    log.warn("matchList is empty for {}#{}", gameName, tagLine);
+                }
+            } else {
+                log.warn("response is null or has no 'data' key. Keys: {}", response != null ? response.keySet() : "null");
+            }
+        } catch (Exception e) {
+            log.warn("Failed to fetch rank from HenrikDev for {}: {}", username, e.getMessage(), e);
+        }
+
+        RankedInfo ranked = new RankedInfo(rankTier, "", rr, region);
+
+        Map<String, String> extra = new LinkedHashMap<>();
+        extra.put("PUUID",    puuid);
+        extra.put("Provider", "HenrikDev API");
+
+        return PlayerStats.of(Game.VALORANT, username, region,
+                0, 0, 0, 0, 0, ranked, extra);
+    }
+
+    // ─────────────────────────────────────────────
+    // fetchRecentMatches — real data from HenrikDev
+    // ─────────────────────────────────────────────
+    @Override
+    public List<MatchSummary> fetchRecentMatches(String username, String region, int count) {
+        log.info("Fetching last {} Valorant matches for {} ({})", count, username, region);
+
+        String[] parts  = username.contains("#") ? username.split("#", 2) : new String[]{username, "NA1"};
+        String gameName = parts[0];
+        String tagLine  = parts[1];
+
+        List<MatchSummary> matches = new ArrayList<>();
+
+        try {
+            Map<?, ?> response = henrikWebClient.get()
+                    .uri("/valorant/v4/matches/{region}/pc/{name}/{tag}?size={count}",
+                            region.toLowerCase(), gameName, tagLine, count)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+
+            if (response == null || !response.containsKey("data")) {
+                log.warn("No match data returned for {}", username);
+                return matches;
+            }
+
+            List<Map<?, ?>> matchList = (List<Map<?, ?>>) response.get("data");
+
+            for (Map<?, ?> match : matchList) {
+
+                // ── metadata ──
+                Map<?, ?> metadata     = (Map<?, ?>) match.get("metadata");
+                String    mapName      = ((Map<?, ?>) metadata.get("map")).get("name").toString();
+                long      gameLengthMs = ((Number) metadata.get("game_length_in_ms")).longValue();
+                String    startedAt    = (String) metadata.get("started_at");
+
+                // ── find the requested player ──
+                Map<?, ?> targetPlayer = findPlayer(match, gameName, tagLine);
+                if (targetPlayer == null) {
+                    log.warn("Player {}#{} not found in match, skipping", gameName, tagLine);
+                    continue;
+                }
+
+                String playerName = (String) targetPlayer.get("name");
+                String playerTag  = (String) targetPlayer.get("tag");
+                String teamId     = (String) targetPlayer.get("team_id");
+
+                // ── agent ──
+                Map<?, ?> agent   = (Map<?, ?>) targetPlayer.get("agent");
+                String agentName  = (String) agent.get("name");
+
+                // ── tier ──
+                Map<?, ?> tier    = (Map<?, ?>) targetPlayer.get("tier");
+                String tierName   = (String) tier.get("name");
+
+                // ── stats ──
+                Map<?, ?> stats   = (Map<?, ?>) targetPlayer.get("stats");
+                int score         = ((Number) stats.get("score")).intValue();
+                int kills         = ((Number) stats.get("kills")).intValue();
+                int deaths        = ((Number) stats.get("deaths")).intValue();
+                int assists       = ((Number) stats.get("assists")).intValue();
+                int headshots     = ((Number) stats.get("headshots")).intValue();
+                int bodyshots     = ((Number) stats.get("bodyshots")).intValue();
+                int legshots      = ((Number) stats.get("legshots")).intValue();
+
+                Map<?, ?> damage  = (Map<?, ?>) stats.get("damage");
+                int dealt         = ((Number) damage.get("dealt")).intValue();
+                int received      = ((Number) damage.get("received")).intValue();
+
+                // ── win/loss from teams block ──
+                MatchSummary.Outcome outcome = resolveOutcome(match, teamId);
+
+                matches.add(new MatchSummary(
+                        UUID.randomUUID().toString(),
+                        Game.VALORANT,
+                        playerName + "#" + playerTag,
+                        outcome,
+                        kills,
+                        deaths,
+                        assists,
+                        score,
+                        agentName,
+                        mapName,
+                        (int) (gameLengthMs / 1000),
+                        Instant.parse(startedAt),
+                        Map.of(
+                                "Tier",      tierName,
+                                "Headshots", String.valueOf(headshots),
+                                "Bodyshots", String.valueOf(bodyshots),
+                                "Legshots",  String.valueOf(legshots),
+                                "Dealt",     String.valueOf(dealt),
+                                "Received",  String.valueOf(received)
+                        )
+                ));
+            }
+
+        } catch (Exception e) {
+            log.error("Failed to fetch recent matches for {}: {}", username, e.getMessage(), e);
+        }
+
+        return matches;
+    }
+
+    // ─────────────────────────────────────────────
+    // Helpers
+    // ─────────────────────────────────────────────
+
+    private String resolvePuuid(String gameName, String tagLine) {
+        try {
+            Map<?, ?> account = riotWebClient.get()
                     .uri("/riot/account/v1/accounts/by-riot-id/{gameName}/{tagLine}", gameName, tagLine)
                     .retrieve()
                     .bodyToMono(Map.class)
                     .block();
             if (account != null && account.containsKey("puuid")) {
-                puuid = (String) account.get("puuid");
+                return (String) account.get("puuid");
             }
         } catch (Exception e) {
-            log.warn("Official Riot API call failed (likely due to mock API key). Proceeding without PUUID. Error: {}", e.getMessage());
+            log.warn("PUUID resolution failed for {}#{}: {}", gameName, tagLine, e.getMessage());
         }
-
-        // Optional: Call HenrikDev API to get real Valorant MMR/Rank
-        // https://api.henrikdev.xyz/valorant/v1/mmr/{region}/{name}/{tag}
-        String rankTier = "Unranked";
-        String rankName = "";
-        int rr = 0;
-        
-        try {
-            Map<?, ?> mmrResponse = WebClient.create("https://api.henrikdev.xyz")
-                    .get()
-                    .uri("/valorant/v1/mmr/{region}/{name}/{tag}", region.toLowerCase(), gameName, tagLine)
-                    .retrieve()
-                    .bodyToMono(Map.class)
-                    .block();
-
-            if (mmrResponse != null && mmrResponse.containsKey("data")) {
-                Map<?, ?> data = (Map<?, ?>) mmrResponse.get("data");
-                rankTier = (String) data.get("currenttierpatched");
-                rr = (Integer) data.get("ranking_in_tier");
-            }
-        } catch (Exception e) {
-            log.warn("Failed to fetch MMR from HenrikDev API for {}: {}", username, e.getMessage());
-        }
-
-        RankedInfo ranked = new RankedInfo(rankTier, rankName, rr, "Unknown");
-        Map<String, String> extra = new LinkedHashMap<>();
-        extra.put("PUUID", puuid);
-        extra.put("Provider", "HenrikDev API");
-
-        // Return the parsed data
-        return PlayerStats.of(Game.VALORANT, username, region,
-                0, 0, 0, 0, 0, ranked, extra);
+        return "unknown";
     }
 
-    @Override
-    public List<MatchSummary> fetchRecentMatches(String username, String region, int count) {
-        log.info("Fetching last {} Valorant matches for {} ({})", count, username, region);
+    /** Finds the target player by name+tag inside a match's players list. */
+    private Map<?, ?> findPlayer(Map<?, ?> match, String gameName, String tagLine) {
+        List<Map<?, ?>> players = (List<Map<?, ?>>) match.get("players");
+        if (players == null) return null;
 
-        // In production, call /val/match/v1/matchlists/by-puuid/{puuid}
-        // and then /val/match/v1/matches/{matchId} for each match.
-        List<MatchSummary> matches = new ArrayList<>();
-        String[] agents = {"Jett", "Reyna", "Sage", "Omen", "Sova", "Chamber"};
-        String[] maps = {"Ascent", "Bind", "Haven", "Split", "Icebox", "Breeze"};
-        Random rng = new Random(username.hashCode());
+        return players.stream()
+                .filter(p -> gameName.equalsIgnoreCase((String) p.get("name"))
+                        && tagLine.equalsIgnoreCase((String) p.get("tag")))
+                .findFirst()
+                .orElse(null);
+    }
 
-        for (int i = 0; i < count; i++) {
-            MatchSummary.Outcome outcome = rng.nextBoolean()
-                    ? MatchSummary.Outcome.WIN
-                    : MatchSummary.Outcome.LOSS;
+    /** Resolves WIN/LOSS by looking up the player's team in the teams block. */
+    private MatchSummary.Outcome resolveOutcome(Map<?, ?> match, String teamId) {
+        try {
+            List<Map<?, ?>> teams = (List<Map<?, ?>>) match.get("teams");
+            if (teams == null) return MatchSummary.Outcome.LOSS;
 
-            matches.add(new MatchSummary(
-                    UUID.randomUUID().toString(),
-                    Game.VALORANT,
-                    username,
-                    outcome,
-                    rng.nextInt(15) + 5,    // kills
-                    rng.nextInt(12) + 2,    // deaths
-                    rng.nextInt(10) + 1,    // assists
-                    rng.nextInt(200) + 100, // combat score
-                    agents[rng.nextInt(agents.length)],
-                    maps[rng.nextInt(maps.length)],
-                    (rng.nextInt(20) + 25) * 60, // 25–45 min
-                    Instant.now().minusSeconds(i * 3600L),
-                    Map.of("Headshots", String.valueOf(rng.nextInt(15) + 3))
-            ));
+            return teams.stream()
+                    .filter(t -> teamId.equalsIgnoreCase((String) t.get("team_id")))
+                    .findFirst()
+                    .map(t -> Boolean.TRUE.equals(t.get("won"))
+                            ? MatchSummary.Outcome.WIN
+                            : MatchSummary.Outcome.LOSS)
+                    .orElse(MatchSummary.Outcome.LOSS);
+        } catch (Exception e) {
+            log.warn("Could not resolve outcome for team {}: {}", teamId, e.getMessage());
+            return MatchSummary.Outcome.LOSS;
         }
-        return matches;
     }
 }

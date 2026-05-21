@@ -16,6 +16,7 @@ public class ExternalSecrets {
 
     /** Riot Games API key (used by RiotApiClient) */
     private String riotApiKey;
+    private String henrikApiKey;
 
     /** Apex Tracker.gg API key */
     private String apexApiKey;
@@ -30,6 +31,9 @@ public class ExternalSecrets {
 
     public String getRiotApiKey() { return riotApiKey; }
     public void setRiotApiKey(String riotApiKey) { this.riotApiKey = riotApiKey; }
+
+    public String getHenrikApiKey() {return henrikApiKey;}
+    public void setHenrikApiKey(String henrikApiKey) {this.henrikApiKey = henrikApiKey;}
 
     public String getApexApiKey() { return apexApiKey; }
     public void setApexApiKey(String apexApiKey) { this.apexApiKey = apexApiKey; }

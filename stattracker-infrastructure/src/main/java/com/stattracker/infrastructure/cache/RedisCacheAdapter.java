@@ -29,6 +29,7 @@ public class RedisCacheAdapter implements StatsCachePort {
     public RedisCacheAdapter(StringRedisTemplate redis) {
         this.redis = redis;
         this.objectMapper = new ObjectMapper();
+        this.objectMapper.configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
         this.objectMapper.registerModule(new JavaTimeModule());
     }
 

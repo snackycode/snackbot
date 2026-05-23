@@ -39,9 +39,10 @@ public class HistoryCommandHandler implements SlashCommandHandler {
         String gameStr = event.getOption("game", OptionMapping::getAsString);
         String username = event.getOption("username", OptionMapping::getAsString);
         int count = event.getOption("count", DEFAULT_COUNT, OptionMapping::getAsInt);
+        String region = event.getOption("region", "", OptionMapping::getAsString);
 
         Game game = Game.fromString(gameStr);
-        String region = game.getValidRegions()[0]; // default
+//        String region = game.getValidRegions()[0]; // default
 
         List<MatchSummary> matches = statsUseCase.getRecentMatches(game, username, region, count);
 

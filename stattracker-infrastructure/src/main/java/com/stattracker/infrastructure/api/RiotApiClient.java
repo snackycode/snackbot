@@ -47,13 +47,17 @@ public class RiotApiClient implements GameApiClient {
         // Resolve PUUID via official Riot API
         String puuid = resolvePuuid(gameName, tagLine);
 
-        // Pull the most recent match to get current rank
+        // We will pull the last 10 matches to aggregate stats and get current rank
         String rankTier = "Unranked";
-        int    rr       = 0;
+        int rr = 0;
+        int totalKills = 0;
+        int totalDeaths = 0;
+        int totalWins = 0;
+        int totalMatches = 0;
 
         try {
             Map<?, ?> response = henrikWebClient.get()
-                    .uri("/valorant/v4/matches/{region}/pc/{name}/{tag}?size=1",
+                    .uri("/valorant/v4/matches/{region}/pc/{name}/{tag}?size=10",
                             region.toLowerCase(), gameName, tagLine)
                     .retrieve()
                     .bodyToMono(Map.class)
@@ -62,34 +66,52 @@ public class RiotApiClient implements GameApiClient {
             if (response != null && response.containsKey("data")) {
                 List<Map<?, ?>> matchList = (List<Map<?, ?>>) response.get("data");
 
-                if (!matchList.isEmpty()) {
-                    Map<?, ?> firstMatch = matchList.get(0);
-                    Map<?, ?> targetPlayer = findPlayer(firstMatch, gameName, tagLine);
-
+                for (Map<?, ?> match : matchList) {
+                    Map<?, ?> targetPlayer = findPlayer(match, gameName, tagLine);
+                    
                     if (targetPlayer != null) {
-                        Map<?, ?> tier = (Map<?, ?>) targetPlayer.get("tier");
-                        rankTier = (String) tier.get("name");
-                    } else {
-                        log.warn("targetPlayer is null for {}#{}", gameName, tagLine);
+                        // Capture rank from the most recent match only
+                        if (totalMatches == 0) {
+                            Map<?, ?> tier = (Map<?, ?>) targetPlayer.get("tier");
+                            if (tier != null && tier.get("name") != null) {
+                                rankTier = (String) tier.get("name");
+                            }
+                        }
+
+                        // Aggregate stats
+                        Map<?, ?> stats = (Map<?, ?>) targetPlayer.get("stats");
+                        if (stats != null) {
+                            totalKills += ((Number) stats.get("kills")).intValue();
+                            totalDeaths += ((Number) stats.get("deaths")).intValue();
+                        }
+                        
+                        String teamId = (String) targetPlayer.get("team_id");
+                        if (MatchSummary.Outcome.WIN == resolveOutcome(match, teamId)) {
+                            totalWins++;
+                        }
+                        
+                        totalMatches++;
                     }
-                } else {
-                    log.warn("matchList is empty for {}#{}", gameName, tagLine);
                 }
             } else {
-                log.warn("response is null or has no 'data' key. Keys: {}", response != null ? response.keySet() : "null");
+                log.warn("response is null or has no 'data' key.");
             }
         } catch (Exception e) {
-            log.warn("Failed to fetch rank from HenrikDev for {}: {}", username, e.getMessage(), e);
+            log.warn("Failed to fetch matches for stats from HenrikDev for {}: {}", username, e.getMessage(), e);
         }
 
         RankedInfo ranked = new RankedInfo(rankTier, "", rr, region);
 
         Map<String, String> extra = new LinkedHashMap<>();
-        extra.put("PUUID",    puuid);
+        extra.put("PUUID", puuid);
         extra.put("Provider", "HenrikDev API");
-
+        extra.put("Note", "Stats based on last " + totalMatches + " matches");
+        
+        log.info("End of Fetching for {} ({})", username, region);
+        
+        // Pass the aggregated stats into PlayerStats.of()
         return PlayerStats.of(Game.VALORANT, username, region,
-                0, 0, 0, 0, 0, ranked, extra);
+                0, totalKills, totalDeaths, totalWins, totalMatches, ranked, extra);
     }
 
     // ─────────────────────────────────────────────

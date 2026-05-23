@@ -23,7 +23,7 @@ import java.util.Optional;
 public class StatsService implements StatsUseCase {
 
     private static final Logger log = LoggerFactory.getLogger(StatsService.class);
-    private static final Duration CACHE_TTL = Duration.ofMinutes(5);
+    private static final Duration CACHE_TTL = Duration.ofMinutes(15);
 
     private final GameApiClientFactory apiClientFactory;
     private final StatsCachePort statsCache;
@@ -43,7 +43,7 @@ public class StatsService implements StatsUseCase {
             return cached.get();
         }
 
-        log.debug("Cache MISS for {} — calling {} API", cacheKey, game.getDisplayName());
+        log.debug("Cache MISS for {} calling {} API", cacheKey, game.getDisplayName());
         GameApiClient client = apiClientFactory.getClient(game);
         PlayerStats stats = client.fetchPlayerStats(username, region);
 
